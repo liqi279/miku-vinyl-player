@@ -1,0 +1,16 @@
+# Build output
+tools/build/
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
