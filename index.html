@@ -67,8 +67,12 @@
     background: conic-gradient(from 210deg, transparent 0deg, rgba(255,255,255,.10) 26deg, transparent 56deg, transparent 180deg, rgba(255,255,255,.06) 216deg, transparent 252deg);
   }
 
-  /* 旋转层：中心标签 + 可见的旋转标记 */
-  .disc-spin { position:absolute; inset:0; border-radius:50%; }
+  /* 旋转层：中心标签 + 可见的旋转标记
+     旋转圆心显式钉在几何中心，缩放/旋转都不会让中心偏移 */
+  .disc-spin {
+    position:absolute; inset:0; border-radius:50%;
+    transform-origin:50% 50%;
+  }
   .vinyl.playing .disc-spin { animation: spin 3.2s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   /* 旋转标记：让转动肉眼可见（仅高光条，无斑点） */
@@ -77,8 +81,11 @@
     background: conic-gradient(from 0deg, transparent 0deg, rgba(255,255,255,.16) 22deg, transparent 50deg, transparent 180deg, rgba(255,255,255,.08) 205deg, transparent 235deg);
   }
 
+  /* 中心标签：用 50% + translate 居中，不依赖 margin:auto
+     （margin:auto 居中会被宿主页面的 .label 样式 / 全局 reset 破坏，导致黑区偏心） */
   .label {
-    position:absolute; inset:0; margin:auto;
+    position:absolute; left:50%; top:50%;
+    margin:0; transform:translate(-50%,-50%);
     width:60px; height:60px; border-radius:50%;
     background: radial-gradient(circle at 40% 35%, #1c2230 0%, #12151d 70%);
     display:flex; align-items:center; justify-content:center;
@@ -301,13 +308,19 @@
   #ctx-menu .a-row.on .a-badge { background:rgba(90,156,255,.35); color:#cfe2ff; }
   #mini-ball {
     position:fixed; right:36px; bottom:36px; z-index:99998;
-    width:40px; height:40px; border-radius:50%; border:none; cursor:pointer;
+    width:40px; height:40px; border-radius:50%; border:none; cursor:grab;
     display:none;
+    padding:0; touch-action:none;
+    user-select:none; -webkit-user-select:none;
     background: repeating-radial-gradient(circle, #1b1b22 0px, #1b1b22 2px, #2a2a33 3px, #141419 5px);
     box-shadow: 0 6px 16px rgba(0,0,0,.5);
+    transition: box-shadow .18s, filter .18s;
   }
+  #mini-ball:hover { filter:brightness(1.18); box-shadow: 0 8px 20px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.16); }
+  #mini-ball.dragging { cursor:grabbing; }
   #mini-ball::after {
-    content:''; position:absolute; inset:0; margin:auto;
+    content:''; position:absolute; left:50%; top:50%; margin:0;
+    transform:translate(-50%,-50%);
     width:13px; height:13px; border-radius:50%;
     background: conic-gradient(from 0deg, #ff5f8f, #e94560, #b23a72, #ff5f8f);
     box-shadow: 0 0 0 2px #101014;
@@ -342,7 +355,7 @@
       <div class="spin-mark"></div>
     </div>
     <canvas class="spectrum" id="spectrum" width="440" height="440"></canvas>
-    <div class="hole" id="centerHole" style="position:absolute; inset:0; margin:auto; width:8px; height:8px; border-radius:50%; background: radial-gradient(circle at 40% 35%, #3a3a44, #0c0c10); box-shadow: 0 0 0 1.5px rgba(255,255,255,.15); z-index:4;"></div>
+    <div class="hole" id="centerHole" style="position:absolute; left:50%; top:50%; margin:0; transform:translate(-50%,-50%); width:8px; height:8px; border-radius:50%; background: radial-gradient(circle at 40% 35%, #3a3a44, #0c0c10); box-shadow: 0 0 0 1.5px rgba(255,255,255,.15); z-index:4;"></div>
     <div class="gloss"></div>
   </div>
   <div class="tonearm" id="tonearm">
@@ -890,12 +903,139 @@
     else if (act === 'random') { randomLoad(); }
     else if (act === 'prev') { load(idx < 0 ? 0 : idx - 1, true); }
     else if (act === 'next') { load(idx < 0 ? 0 : idx + 1, true); }
-    else if (act === 'hide') { widget.style.display = 'none'; miniBall.style.display = 'block'; closeMenu(); }
+    else if (act === 'hide') { collapseToBall(); }
   });
-  miniBall.onclick = function () {
-    widget.style.display = 'block';
+
+  /* ================= 收起小球：拖动 / 贴边半隐 / 点击展开 / 持久化 ================= */
+  var BALL_KEY = 'miku-player-mini-ball';
+  var BALL_SIZE = 40, BALL_HALF = 20, BALL_SNAP = 24;
+  var ball = { x: null, y: null, snapped: null, collapsed: false };
+  var ballDrag = null;
+
+  function loadBall() {
+    try {
+      var s = JSON.parse(localStorage.getItem(BALL_KEY) || 'null');
+      if (!s || typeof s.x !== 'number' || typeof s.y !== 'number') return;
+      ball.x = s.x; ball.y = s.y;
+      ball.snapped = s.snapped || null;
+      ball.collapsed = !!s.collapsed;
+    } catch (e) {}
+  }
+  function saveBall() {
+    try { localStorage.setItem(BALL_KEY, JSON.stringify(ball)); } catch (e) {}
+  }
+  /* 允许半个球出界（吸附态），其余位置拉回视口内 */
+  function clampBall(x, y) {
+    return {
+      x: Math.min(Math.max(x, -BALL_HALF), window.innerWidth - BALL_SIZE + BALL_HALF),
+      y: Math.min(Math.max(y, -BALL_HALF), window.innerHeight - BALL_SIZE + BALL_HALF)
+    };
+  }
+  /* 距任一边 <= 24px 即吸附到最近的边，并向内收半个球身（只露一半） */
+  function snapBall(x, y) {
+    var w = window.innerWidth, h = window.innerHeight;
+    var dl = x, dr = w - (x + BALL_SIZE), dt = y, db = h - (y + BALL_SIZE);
+    var min = Math.min(dl, dr, dt, db);
+    if (min > BALL_SNAP) { ball.snapped = null; return { x: x, y: y }; }
+    if (min === dl) { ball.snapped = 'left';   return { x: -BALL_HALF, y: y }; }
+    if (min === dr) { ball.snapped = 'right';  return { x: w - BALL_HALF, y: y }; }
+    if (min === dt) { ball.snapped = 'top';    return { x: x, y: -BALL_HALF }; }
+    ball.snapped = 'bottom';                   return { x: x, y: h - BALL_HALF };
+  }
+  function paintBall() {
+    miniBall.style.left = ball.x + 'px';
+    miniBall.style.top = ball.y + 'px';
+    miniBall.style.right = 'auto';
+    miniBall.style.bottom = 'auto';
+  }
+  function placeBall() {
+    var p = clampBall(ball.x, ball.y);
+    // 吸附态：按当前视口重新贴边（窗口缩放 / 移动端地址栏变化后不会留在视口外）
+    if (ball.snapped === 'left') p.x = -BALL_HALF;
+    else if (ball.snapped === 'right') p.x = window.innerWidth - BALL_HALF;
+    else if (ball.snapped === 'top') p.y = -BALL_HALF;
+    else if (ball.snapped === 'bottom') p.y = window.innerHeight - BALL_HALF;
+    p = clampBall(p.x, p.y);
+    ball.x = p.x; ball.y = p.y;
+    paintBall();
+  }
+  function collapseToBall() {
+    // 首次收起：小球出现在胶片当前位置
+    if (ball.x === null) {
+      var r = widget.getBoundingClientRect();
+      ball.x = r.left + (r.width - BALL_SIZE) / 2;
+      ball.y = r.top + (r.height - BALL_SIZE) / 2;
+      ball.snapped = null;
+    }
+    ball.collapsed = true;
+    widget.style.display = 'none';
+    miniBall.style.display = 'block';
+    placeBall();
+    saveBall();
+    closeMenu();
+  }
+  function expandFromBall() {
     miniBall.style.display = 'none';
-  };
+    widget.style.display = 'block';
+    // 若此前拖动过胶片，恢复原位并保证不越出视口
+    if (widget.style.left) {
+      var maxL = Math.max(0, window.innerWidth - widget.offsetWidth);
+      var maxT = Math.max(0, window.innerHeight - widget.offsetHeight);
+      widget.style.left = Math.min(Math.max(parseFloat(widget.style.left) || 0, 0), maxL) + 'px';
+      widget.style.top = Math.min(Math.max(parseFloat(widget.style.top) || 0, 0), maxT) + 'px';
+    }
+    ball.collapsed = false;
+    saveBall();
+  }
+
+  miniBall.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    ballDrag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, bx: ball.x, by: ball.y, moved: false };
+    miniBall.classList.add('dragging');
+    try { miniBall.setPointerCapture(e.pointerId); } catch (er) {}
+  });
+  miniBall.addEventListener('pointermove', function (e) {
+    if (!ballDrag || e.pointerId !== ballDrag.id) return;
+    var dx = e.clientX - ballDrag.sx, dy = e.clientY - ballDrag.sy;
+    if (!ballDrag.moved && Math.abs(dx) + Math.abs(dy) > 4) {
+      ballDrag.moved = true;
+      ball.snapped = null;             // 拖动时先解除吸附，跟手
+    }
+    if (!ballDrag.moved) return;
+    var p = clampBall(ballDrag.bx + dx, ballDrag.by + dy);
+    ball.x = p.x; ball.y = p.y;
+    paintBall();
+  });
+  miniBall.addEventListener('pointerup', function (e) {
+    if (!ballDrag || e.pointerId !== ballDrag.id) return;
+    var d = ballDrag; ballDrag = null;
+    miniBall.classList.remove('dragging');
+    try { miniBall.releasePointerCapture(d.id); } catch (er) {}
+    if (!d.moved) { expandFromBall(); return; }   // 未拖动 = 点击 → 展开
+    var p = snapBall(ball.x, ball.y);
+    ball.x = p.x; ball.y = p.y;
+    paintBall();
+    saveBall();
+  });
+  miniBall.addEventListener('pointercancel', function () {
+    ballDrag = null;
+    miniBall.classList.remove('dragging');
+  });
+  miniBall.addEventListener('click', function (e) { e.stopPropagation(); });
+
+  /* 窗口 / 移动端视口变化：重新计算吸附，避免小球和胶片被留在视口外 */
+  function onViewportResize() {
+    if (miniBall.style.display === 'block') placeBall();
+    if (widget.style.display !== 'none' && widget.style.left) {
+      var maxL = Math.max(0, window.innerWidth - widget.offsetWidth);
+      var maxT = Math.max(0, window.innerHeight - widget.offsetHeight);
+      widget.style.left = Math.min(Math.max(parseFloat(widget.style.left) || 0, 0), maxL) + 'px';
+      widget.style.top = Math.min(Math.max(parseFloat(widget.style.top) || 0, 0), maxT) + 'px';
+    }
+  }
+  window.addEventListener('resize', onViewportResize);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', onViewportResize);
 
   /* ================= 搜索：多数据源并行 + 5 秒超时 =================
    * 数据源（均已实测可在浏览器跨域直连）：
@@ -2221,6 +2361,14 @@
   });
 
   /* ================= 启动 ================= */
+  /* 恢复上次的小球：位置 + 收起状态（刷新后保持） */
+  loadBall();
+  if (ball.x !== null) placeBall();
+  if (ball.collapsed) {
+    widget.style.display = 'none';
+    miniBall.style.display = 'block';
+  }
+
   widget.classList.add('loading');
   mTip.textContent = '曲库加载中…';
   fetchLibrary().then(function (list) {
